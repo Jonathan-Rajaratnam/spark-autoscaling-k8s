@@ -1,0 +1,16 @@
+grafana:
+  enabled: true
+
+  adminUser: admin
+  adminPassword: admin  # OK for local & FYP (change in cloud later)
+
+  service:
+    type: NodePort
+    nodePort: 30000
+
+  defaultDashboardsEnabled: true
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    serviceMonitorSelectorNilUsesHelmValues: false

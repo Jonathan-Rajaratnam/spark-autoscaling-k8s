@@ -1,0 +1,55 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: spark-app
+spec:
+  type: Python
+  mode: cluster
+  image: jonathan/spark-app:1.2
+  imagePullPolicy: IfNotPresent
+
+  mainApplicationFile: local:///opt/spark/app.py
+  arguments:
+    - "top_games" # Options: top_games, sentiment, user_activity
+  sparkVersion: "3.5.0"
+
+  sparkConf:
+    # Controls executor pod name prefix (otherwise derived from spark.app.name)
+    spark.kubernetes.executor.podNamePrefix: "spark-app"
+    # Keep Spark's internal app name aligned with the Kubernetes resource name
+    spark.app.name: "spark-app"
+
+    spark.dynamicAllocation.enabled: "true"
+    spark.dynamicAllocation.shuffleTracking.enabled: "true"
+    spark.dynamicAllocation.initialExecutors: "1"
+    spark.dynamicAllocation.minExecutors: "1"
+    spark.dynamicAllocation.maxExecutors: "5"
+
+    spark.dynamicAllocation.schedulerBacklogTimeout: "5s"
+    spark.dynamicAllocation.sustainedSchedulerBacklogTimeout: "10s"
+    spark.dynamicAllocation.executorIdleTimeout: "60s"
+
+  executor:
+    #instances: 2  # Commented out to use dynamic allocation
+    cores: 1
+    memory: 512m
+    labels:
+      app-role: spark-executor
+    ports:
+      - name: metrics
+        containerPort: 9404
+    javaOptions: >
+      -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml
+
+
+  driver:
+    cores: 1
+    memory: "512m"
+    serviceAccount: spark
+    labels:
+      app-role: spark-driver
+    ports:
+      - name: metrics
+        containerPort: 9404
+    javaOptions: >
+      -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml

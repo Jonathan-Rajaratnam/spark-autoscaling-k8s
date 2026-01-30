@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-metrics
+  labels:
+    app: spark
+spec:
+  selector:
+    spark-role: executor
+  ports:
+    - name: metrics
+      port: 9404
+      targetPort: 9404
