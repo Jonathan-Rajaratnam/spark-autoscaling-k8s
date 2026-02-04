@@ -5,13 +5,18 @@ metadata:
 spec:
   type: Python
   mode: cluster
-  image: jonathan/spark-app:1.2
+  image: jonathan/spark-app:1.4
   imagePullPolicy: IfNotPresent
 
   mainApplicationFile: local:///opt/spark/app.py
   arguments:
     - "top_games" # Options: top_games, sentiment, user_activity
   sparkVersion: "3.5.0"
+  
+  volumes:
+    - name: data
+      hostPath:
+        path: /Users/jonathan/Docs/spark-app/data
 
   sparkConf:
     # Controls executor pod name prefix (otherwise derived from spark.app.name)
@@ -23,7 +28,7 @@ spec:
     spark.dynamicAllocation.shuffleTracking.enabled: "true"
     spark.dynamicAllocation.initialExecutors: "1"
     spark.dynamicAllocation.minExecutors: "1"
-    spark.dynamicAllocation.maxExecutors: "5"
+    spark.dynamicAllocation.maxExecutors: "3"
 
     spark.dynamicAllocation.schedulerBacklogTimeout: "5s"
     spark.dynamicAllocation.sustainedSchedulerBacklogTimeout: "10s"
@@ -40,6 +45,12 @@ spec:
         containerPort: 9404
     javaOptions: >
       -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml
+    env:
+      - name: DATA_PATH
+        value: /data
+    volumeMounts:
+      - name: data
+        mountPath: /data
 
 
   driver:
@@ -53,3 +64,9 @@ spec:
         containerPort: 9404
     javaOptions: >
       -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml
+    env:
+      - name: DATA_PATH
+        value: /data
+    volumeMounts:
+      - name: data
+        mountPath: /data
