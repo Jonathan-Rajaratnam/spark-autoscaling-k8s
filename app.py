@@ -14,6 +14,7 @@ df = spark.read.option("header", True).csv(data_path)
 df = df.repartition(300)
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "top_games"
+start_time = time.time()
 
 if mode == "top_games":
     result = df.groupBy("app_id").count()
@@ -31,6 +32,9 @@ else:
 output_path = os.path.join(data_dir, "output", mode)
 print(f"Writing results to {output_path}")
 result.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+
+elapsed = time.time() - start_time
+print(f"[BENCHMARK] Job elapsed: {elapsed:.2f}s  mode={mode}")
 
 # Keep job alive to observe scale-down
 time.sleep(120)
