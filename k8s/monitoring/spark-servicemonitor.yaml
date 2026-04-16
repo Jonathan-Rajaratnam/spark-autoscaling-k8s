@@ -5,8 +5,12 @@ metadata:
   namespace: monitoring
 spec:
   selector:
-    matchLabels:
-      app: spark
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - spark
+          - spark-worker
   namespaceSelector:
     matchNames:
       - default
