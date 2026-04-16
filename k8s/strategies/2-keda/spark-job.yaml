@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-submit-keda
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        strategy: keda
+        app: spark-submit
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: spark-submit
+          image: jonathan/spark-app:1.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/spark/bin/spark-submit
+            - --master
+            - spark://spark-master-keda:7077
+            - --deploy-mode
+            - client
+            - --conf
+            - spark.driver.host=$(POD_IP)
+            - --conf
+            - spark.driver.bindAddress=0.0.0.0
+            - --conf
+            - spark.app.name=spark-app-keda
+            - --conf
+            - spark.executor.memory=512m
+            - --conf
+            - spark.executor.cores=1
+            - /opt/spark/app.py
+            - top_games  # Options: top_games, sentiment, user_activity
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: DATA_PATH
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          hostPath:
+            path: /Users/jonathan/Docs/spark-app/data

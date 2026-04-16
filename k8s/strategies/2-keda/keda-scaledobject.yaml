@@ -1,0 +1,44 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: spark-worker-scaledobject
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: spark-worker-keda
+  minReplicaCount: 1
+  maxReplicaCount: 3
+  pollingInterval: 15   # seconds between metric checks
+  cooldownPeriod: 60    # seconds to wait before scaling down
+
+  triggers:
+    # Trigger 1: JVM heap usage > 65% across all KEDA workers
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        metricName: jvm_heap_usage_percent
+        threshold: "65"
+        query: >
+          avg(
+            jvm_memory_bytes_used{area="heap", pod=~"spark-worker-keda.*"}
+            /
+            jvm_memory_bytes_max{area="heap", pod=~"spark-worker-keda.*"}
+            * 100
+          )
+
+    # Trigger 2: CPU usage > 70% of limit across all KEDA workers
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        metricName: worker_cpu_utilisation
+        threshold: "70"
+        query: >
+          avg(
+            rate(container_cpu_usage_seconds_total{
+              namespace="default",
+              pod=~"spark-worker-keda.*",
+              container="spark-worker"
+            }[1m])
+          ) * 100
