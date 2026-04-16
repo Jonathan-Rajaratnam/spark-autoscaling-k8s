@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-worker-hpa
+  labels:
+    strategy: hpa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-worker
+      strategy: hpa
+  template:
+    metadata:
+      labels:
+        app: spark-worker
+        strategy: hpa
+    spec:
+      containers:
+        - name: spark-worker
+          image: jonathan/spark-app:1.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/spark/bin/spark-class
+            - org.apache.spark.deploy.worker.Worker
+            - spark://spark-master-hpa:7077
+          ports:
+            - name: metrics
+              containerPort: 9404
+          env:
+            - name: SPARK_WORKER_MEMORY
+              value: "1g"
+            - name: SPARK_WORKER_CORES
+              value: "1"
+            - name: SPARK_WORKER_OPTS
+              value: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          hostPath:
+            path: /Users/jonathan/Docs/spark-app/data
+---
+# Metrics service so Prometheus can scrape HPA workers by label
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-worker-hpa-metrics
+  labels:
+    strategy: hpa
+    app: spark-worker
+spec:
+  selector:
+    app: spark-worker
+    strategy: hpa
+  ports:
+    - name: metrics
+      port: 9404
+      targetPort: 9404

@@ -1,0 +1,48 @@
+# Helm values for: prometheus-community/prometheus-adapter
+# Install command:
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     --namespace monitoring \
+#     -f k8s/strategies/3-hpa/prometheus-adapter-values.yaml
+
+prometheus:
+  url: http://monitoring-kube-prometheus-prometheus.monitoring.svc
+  port: 9090
+
+rules:
+  custom:
+    # Metric 1: spark_jvm_heap_usage_percent
+    # Derived from JMX-exported jvm_memory_bytes_used/max (always present)
+    - seriesQuery: 'jvm_memory_bytes_used{area="heap",namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^jvm_memory_bytes_used$"
+        as: "spark_jvm_heap_usage_percent"
+      metricsQuery: >
+        avg(
+          jvm_memory_bytes_used{area="heap",<<.LabelMatchers>>}
+          /
+          jvm_memory_bytes_max{area="heap",<<.LabelMatchers>>}
+          * 100
+        ) by (<<.GroupBy>>)
+
+    # Metric 2: spark_worker_cpu_millicores
+    # Derived from cAdvisor container_cpu_usage_seconds_total (guaranteed present)
+    - seriesQuery: 'container_cpu_usage_seconds_total{namespace!="",pod!="",container!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^container_cpu_usage_seconds_total$"
+        as: "spark_worker_cpu_millicores"
+      metricsQuery: >
+        sum(
+          rate(container_cpu_usage_seconds_total{<<.LabelMatchers>>}[1m])
+        ) by (<<.GroupBy>>) * 1000

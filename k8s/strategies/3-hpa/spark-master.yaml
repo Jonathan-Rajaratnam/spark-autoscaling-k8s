@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-master-hpa
+  labels:
+    strategy: hpa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-master
+      strategy: hpa
+  template:
+    metadata:
+      labels:
+        app: spark-master
+        strategy: hpa
+    spec:
+      containers:
+        - name: spark-master
+          image: jonathan/spark-app:1.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/spark/bin/spark-class
+            - org.apache.spark.deploy.master.Master
+          ports:
+            - name: master
+              containerPort: 7077
+            - name: ui
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9404
+          env:
+            - name: SPARK_MASTER_HOST
+              value: "0.0.0.0"
+            - name: SPARK_MASTER_OPTS
+              value: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-master-hpa
+  labels:
+    strategy: hpa
+    app: spark-master
+spec:
+  selector:
+    app: spark-master
+    strategy: hpa
+  ports:
+    - name: master
+      port: 7077
+      targetPort: 7077
+    - name: ui
+      port: 8080
+      targetPort: 8080
+    - name: metrics
+      port: 9404
+      targetPort: 9404
