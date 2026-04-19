@@ -209,3 +209,7 @@ __marimo__/
 
 #data
 data/
+docs/
+experiment/results/
+
+*.tar
