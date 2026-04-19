@@ -4,14 +4,14 @@
 #
 # Usage:
 #   ./experiment/run_experiment.sh [mode]
-#   mode: top_games (default) | sentiment | user_activity
+#   mode: steam_heavy (default) | property_prices
 #
 # Prerequisites:
 #   - kubectl configured and pointing at your local cluster
 #   - kube-prometheus-stack installed (for Prometheus)
 #   - KEDA installed (for strategy 2)
 #   - Prometheus Adapter installed (for strategy 3)
-#   - metrics-server installed (for kubectl top)
+#   - curl (always available on macOS)
 
 set -euo pipefail
 
@@ -28,8 +28,47 @@ echo "Experiment: mode=${MODE}  started=$(date)" > "$SUMMARY_FILE"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ---------------------------------------------------------------------------
-# collect_metrics <strategy> <pod_selector_label_value>
-# Appends one CSV row using kubectl top (requires metrics-server)
+# Prometheus — accessed via localhost port-forward (started in MAIN)
+# ---------------------------------------------------------------------------
+PROM_LOCAL="http://127.0.0.1:9091"
+PROM_PF_PID=""
+
+start_prom_portforward() {
+  log "Starting Prometheus port-forward on 127.0.0.1:9091..."
+  kubectl port-forward --address 127.0.0.1 svc/monitoring-kube-prometheus-prometheus \
+    9091:9090 -n monitoring &>/dev/null &
+  PROM_PF_PID=$!
+  sleep 3   # give it time to establish
+  log "Prometheus port-forward ready (pid ${PROM_PF_PID})"
+}
+
+stop_prom_portforward() {
+  if [[ -n "${PROM_PF_PID}" ]]; then
+    kill "${PROM_PF_PID}" 2>/dev/null || true
+    log "Prometheus port-forward stopped"
+  fi
+}
+
+
+# ---------------------------------------------------------------------------
+# prom_query <promql>  — returns the integer sum of all instant-query results
+# ---------------------------------------------------------------------------
+prom_query() {
+  local query="$1"
+  local encoded
+  encoded=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
+  curl -sf "${PROM_LOCAL}/api/v1/query?query=${encoded}" 2>/dev/null \
+    | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+vals=[float(r['value'][1]) for r in data.get('data',{}).get('result',[])]
+print(int(sum(vals))) if vals else print(0)
+" 2>/dev/null || echo 0
+}
+
+# ---------------------------------------------------------------------------
+# collect_metrics <strategy> <pod_selector>
+# Appends one CSV row. CPU from Prometheus cAdvisor, memory from working set.
 # ---------------------------------------------------------------------------
 collect_metrics() {
   local strategy="$1"
@@ -37,26 +76,23 @@ collect_metrics() {
   local ts
   ts=$(date +%s)
 
-  local cpu_total=0
-  local mem_total=0
-  local exec_count=0
-
   # Count running pods matching the selector
-  exec_count=$(kubectl get pods -l "$selector" \
+  local exec_count
+  exec_count=$(kubectl get pods -l "${selector}" \
     --field-selector=status.phase=Running \
     --no-headers 2>/dev/null | wc -l | tr -d ' ')
 
-  # Aggregate CPU + memory from kubectl top
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local cpu mem
-    cpu=$(echo "$line" | awk '{print $2}' | tr -d 'm')
-    mem=$(echo "$line" | awk '{print $3}' | tr -d 'Mi')
-    cpu_total=$((cpu_total + ${cpu:-0}))
-    mem_total=$((mem_total + ${mem:-0}))
-  done < <(kubectl top pods -l "$selector" --no-headers 2>/dev/null || true)
+  # CPU millicores via Prometheus (cAdvisor — guaranteed present)
+  local cpu_query="sum(rate(container_cpu_usage_seconds_total{namespace=\"default\",container!=\"\",container!=\"POD\"}[1m])) * 1000"
+  local cpu_total
+  cpu_total=$(prom_query "$cpu_query")
 
-  echo "${strategy},${ts},${exec_count},${cpu_total},${mem_total}" >> "$CSV_FILE"
+  # Memory MiB via Prometheus (working set — excludes cache, matches kubectl top)
+  local mem_query="sum(container_memory_working_set_bytes{namespace=\"default\",container!=\"\",container!=\"POD\"}) / 1048576"
+  local mem_total
+  mem_total=$(prom_query "$mem_query")
+
+  echo "${strategy},${ts},${exec_count},${cpu_total},${mem_total}" >> "${CSV_FILE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -119,7 +155,7 @@ run_dynamic() {
   start_ts=$(date +%s)
 
   # Patch the mode argument into the manifest
-  sed "s/\"top_games\"/\"${MODE}\"/" \
+  sed "s/\"steam_heavy\"/\"${MODE}\"/" \
     k8s/strategies/1-dynamic-allocation/spark-app.yaml \
     | kubectl apply -f -
 
@@ -231,8 +267,12 @@ run_hpa() {
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
+trap stop_prom_portforward EXIT
+
 log "Starting benchmark experiment: mode=${MODE}"
 log "Results will be saved to: ${CSV_FILE}"
+
+start_prom_portforward
 
 run_dynamic
 run_keda
