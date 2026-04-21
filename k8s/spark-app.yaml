@@ -5,7 +5,7 @@ metadata:
 spec:
   type: Python
   mode: cluster
-  image: jonathan/spark-app:1.4
+  image: jonathan/spark-app:1.5
   imagePullPolicy: IfNotPresent
 
   mainApplicationFile: local:///opt/spark/app.py

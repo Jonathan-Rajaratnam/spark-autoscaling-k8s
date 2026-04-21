@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: spark-master
-          image: jonathan/spark-app:1.4
+          image: jonathan/spark-app:1.5
           imagePullPolicy: IfNotPresent
           command:
             - /opt/spark/bin/spark-class

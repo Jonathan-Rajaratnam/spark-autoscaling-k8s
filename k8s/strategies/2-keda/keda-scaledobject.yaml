@@ -17,7 +17,7 @@ spec:
     # Trigger 1: JVM heap usage > 65% across all KEDA workers
     - type: prometheus
       metadata:
-        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090
         metricName: jvm_heap_usage_percent
         threshold: "65"
         query: >
@@ -31,7 +31,7 @@ spec:
     # Trigger 2: CPU usage > 70% of limit across all KEDA workers
     - type: prometheus
       metadata:
-        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090
         metricName: worker_cpu_utilisation
         threshold: "70"
         query: >
