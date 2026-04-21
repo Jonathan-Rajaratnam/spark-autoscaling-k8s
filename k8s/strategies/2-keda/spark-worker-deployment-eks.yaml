@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-worker-keda
+  labels:
+    strategy: keda
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-worker
+      strategy: keda
+  template:
+    metadata:
+      labels:
+        app: spark-worker
+        strategy: keda
+    spec:
+      containers:
+        - name: spark-worker
+          image: jonathan/spark-app:1.5
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/spark/bin/spark-class
+            - org.apache.spark.deploy.worker.Worker
+            - spark://spark-master-keda:7077
+          ports:
+            - name: metrics
+              containerPort: 9404
+          env:
+            - name: SPARK_WORKER_MEMORY
+              value: "1g"
+            - name: SPARK_WORKER_CORES
+              value: "1"
+            - name: SPARK_WORKER_OPTS
+              value: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=9404:/opt/jmx/config.yaml"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: spark-data-pvc
+---
+# Headless service so Prometheus can discover worker pods by label
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-worker-keda-metrics
+  labels:
+    strategy: keda
+    app: spark-worker
+spec:
+  selector:
+    app: spark-worker
+    strategy: keda
+  ports:
+    - name: metrics
+      port: 9404
+      targetPort: 9404

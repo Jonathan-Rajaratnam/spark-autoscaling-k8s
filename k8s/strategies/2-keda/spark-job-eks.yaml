@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: spark-submit-hpa
+  name: spark-submit-keda
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        strategy: hpa
+        strategy: keda
         app: spark-submit
     spec:
       restartPolicy: Never
@@ -18,7 +18,7 @@ spec:
           command:
             - /opt/spark/bin/spark-submit
             - --master
-            - spark://spark-master-hpa:7077
+            - spark://spark-master-keda:7077
             - --deploy-mode
             - client
             - --conf
@@ -26,13 +26,13 @@ spec:
             - --conf
             - spark.driver.bindAddress=0.0.0.0
             - --conf
-            - spark.app.name=spark-app-hpa
+            - spark.app.name=spark-app-keda
             - --conf
             - spark.executor.memory=512m
             - --conf
             - spark.executor.cores=1
             - /opt/spark/app.py
-            - property_prices  # Options: top_games, sentiment, user_activity, steam_heavy, property_prices
+            - steam_heavy  # Options: top_games, sentiment, user_activity, steam_heavy, property_prices
           env:
             - name: POD_IP
               valueFrom:
@@ -45,5 +45,5 @@ spec:
               mountPath: /data
       volumes:
         - name: data
-          hostPath:
-            path: /Users/jonathan/Docs/spark-app/data
+          persistentVolumeClaim:
+            claimName: spark-data-pvc

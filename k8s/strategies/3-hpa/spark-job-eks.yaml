@@ -45,5 +45,5 @@ spec:
               mountPath: /data
       volumes:
         - name: data
-          hostPath:
-            path: /Users/jonathan/Docs/spark-app/data
+          persistentVolumeClaim:
+            claimName: spark-data-pvc

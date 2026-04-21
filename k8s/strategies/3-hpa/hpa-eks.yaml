@@ -21,13 +21,13 @@ spec:
           averageValue: "65"
 
     # Custom Metric 2: CPU millicores > 700m (via Prometheus Adapter) Removed due to limitation of Orbstack
-    # - type: Pods
-    #   pods:
-    #     metric:
-    #       name: spark_worker_cpu_millicores
-    #     target:
-    #       type: AverageValue
-    #       averageValue: "700m"
+    - type: Pods
+      pods:
+        metric:
+          name: spark_worker_cpu_millicores
+        target:
+          type: AverageValue
+          averageValue: "700m"
 
   behavior:
     scaleUp:

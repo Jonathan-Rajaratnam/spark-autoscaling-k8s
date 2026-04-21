@@ -1,0 +1,23 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: spark-benchmark-cluster
+  region: us-east-1
+  version: "1.30"
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: spark-nodes
+    instanceType: m7i-flex.large
+    desiredCapacity: 4
+    minSize: 4
+    maxSize: 4
+    volumeSize: 100
+
+addons:
+  - name: aws-efs-csi-driver
+    wellKnownPolicies:
+      efsCSIController: true
