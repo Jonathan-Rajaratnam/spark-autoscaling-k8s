@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-MODE="${1:-top_games}"
+MODE="${1:-steam_heavy}"
 RESULTS_DIR="experiment/results"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 CSV_FILE="${RESULTS_DIR}/${TIMESTAMP}-${MODE}.csv"
@@ -196,7 +196,7 @@ run_keda() {
   kubectl rollout status deployment/spark-master-keda --timeout=120s
 
   # Patch mode into job and apply
-  sed "s/top_games/${MODE}/" \
+  sed "s/steam_heavy/${MODE}/" \
     k8s/strategies/2-keda/spark-job.yaml \
     | kubectl apply -f -
 
@@ -239,7 +239,7 @@ run_hpa() {
   kubectl rollout status deployment/spark-master-hpa --timeout=120s
 
   # Patch mode into job and apply
-  sed "s/top_games/${MODE}/" \
+  sed "s/steam_heavy/${MODE}/" \
     k8s/strategies/3-hpa/spark-job.yaml \
     | kubectl apply -f -
 
