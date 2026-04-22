@@ -1,164 +1,194 @@
 #!/usr/bin/env python3
 """
-cost_model.py — Converts experiment metrics CSV into a simulated AWS cost
-comparison table across all 3 autoscaling strategies.
-
-Pricing basis: AWS m5.xlarge on-demand, us-east-1  = $0.192 / hr
-  m5.xlarge: 4 vCPU, 16 GiB RAM
-
-Pod sizes (per strategy, post memory fix):
-  Strategy 1 — Dynamic Alloc : 1 vCPU / 512 MiB  → 1/4 vCPU share → $0.0480/hr
-  Strategy 2 — KEDA          : 1 vCPU / 1 GiB    → 1/4 vCPU share → $0.0480/hr
-  Strategy 3 — HPA           : 1 vCPU / 1 GiB    → 1/4 vCPU share → $0.0480/hr
-
-Cost is modelled on vCPU fraction (dominant resource on m5.xlarge for Spark workloads).
+cost_model.py
+Converts per-strategy resource time-series into simulated AWS on-demand cost figures.
+Pricing baseline: AWS m5.xlarge ($0.192/hr, us-east-1)
 
 Usage:
     python3 experiment/cost_model.py experiment/results/<timestamp>-<mode>.csv
 """
 
-import sys
 import csv
-from collections import defaultdict
+import os
+import sys
+from dataclasses import dataclass
+from typing import List
+
 
 # ---------------------------------------------------------------------------
 # Pricing constants (AWS m5.xlarge on-demand, us-east-1, April 2026)
 # ---------------------------------------------------------------------------
-M5_XLARGE_HOURLY = 0.192   # USD/hr
-VCPUS_PER_NODE   = 4       # m5.xlarge has 4 vCPUs
-RAM_GIB_PER_NODE = 16      # m5.xlarge has 16 GiB
+M5_XLARGE_HOURLY = 0.192          # USD per hour
+M5_XLARGE_VCPU   = 4              # vCPUs per node
+M5_XLARGE_MEMORY = 16384          # MiB per node
+SECONDS_PER_HOUR = 3600
 
-# Each worker pod = 1 vCPU → 1/4 of the node's vCPUs
-COST_PER_POD_HR  = M5_XLARGE_HOURLY / VCPUS_PER_NODE   # $0.0480/hr per pod
-COST_PER_POD_SEC = COST_PER_POD_HR / 3600
-
-# Pod memory budget per strategy (GiB) — for reference in output
-POD_MEMORY = {
-    "dynamic": 0.5,   # 512 MiB (Strategy 1 executors)
-    "keda":    1.0,   # 1 GiB   (Strategy 2 workers, post fix)
-    "hpa":     1.0,   # 1 GiB   (Strategy 3 workers, post fix)
-}
-
-STRATEGY_ORDER = ["dynamic", "keda", "hpa"]
+STRATEGY_ORDER = ["dynamic", "keda", "hpa", "dra"]
 STRATEGY_LABELS = {
     "dynamic": "Dynamic Alloc",
+    "dra":     "Dynamic Alloc",
     "keda":    "KEDA",
     "hpa":     "HPA",
 }
 
+@dataclass
+class MetricRow:
+    """Represents one captured metric interval from the experiment harness."""
+    timestamp:      int     # Unix epoch seconds
+    strategy:       str     # "dra" | "keda" | "hpa" | "dynamic"
+    executor_count: int
+    cpu_millicores: float   # total across all executors
+    memory_mib:     float   # total across all executors
+
+
+@dataclass
+class CostSummary:
+    strategy:               str
+    duration_seconds:       float
+    avg_executor_count:     float
+    avg_cpu_millicores:     float
+    avg_memory_mib:         float
+    peak_executor_count:    int
+    peak_cpu_millicores:    float
+    simulated_cost_usd:     float
+    cpu_efficiency_pct:     float   # fraction of provisioned CPU actually used
+    memory_efficiency_pct:  float   # fraction of provisioned memory actually used
+
+
 # ---------------------------------------------------------------------------
-# Data loading
+# Core Analysis Functions
 # ---------------------------------------------------------------------------
-def load_csv(path: str) -> list[dict]:
-    rows = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append({
-                "strategy":       row["strategy"],
-                "timestamp":      int(row["timestamp"]),
-                "executor_count": int(row["executor_count"]),
-                "cpu_millicores": int(row["cpu_millicores"]),
-                "memory_mib":     int(row["memory_mib"]),
-            })
+
+def cost_per_second(cpu_millicores: float, memory_mib: float) -> float:
+    """
+    Compute instantaneous simulated cost (USD/second) for a given resource snapshot.
+
+    Proportional billing: cost = max(cpu_fraction, memory_fraction) * node_cost_per_second
+    where fractions are relative to one m5.xlarge node (4 vCPU / 16 GiB).
+    """
+    if cpu_millicores < 0:
+        raise ValueError(f"cpu_millicores must be >= 0, got {cpu_millicores}")
+    if memory_mib < 0:
+        raise ValueError(f"memory_mib must be >= 0, got {memory_mib}")
+
+    node_cost_per_second = M5_XLARGE_HOURLY / SECONDS_PER_HOUR
+
+    cpu_fraction    = cpu_millicores / (M5_XLARGE_VCPU * 1000)
+    memory_fraction = memory_mib     / M5_XLARGE_MEMORY
+
+    # Dominant-resource billing: whichever resource drives more node usage
+    resource_fraction = max(cpu_fraction, memory_fraction)
+    return resource_fraction * node_cost_per_second
+
+
+def compute_cost_summary(rows: List[MetricRow], interval_seconds: int = 10) -> CostSummary:
+    """
+    Aggregate a list of MetricRow snapshots into a CostSummary for one strategy run.
+    """
+    if not rows:
+        raise ValueError("Cannot compute cost summary for empty metric series.")
+
+    strategies = {r.strategy for r in rows}
+    if len(strategies) > 1:
+        raise ValueError(
+            f"All rows must belong to the same strategy. Found: {strategies}"
+        )
+
+    strategy = rows[0].strategy
+    n = len(rows)
+
+    total_cpu    = sum(r.cpu_millicores for r in rows)
+    total_memory = sum(r.memory_mib     for r in rows)
+    total_exec   = sum(r.executor_count for r in rows)
+
+    avg_cpu    = total_cpu    / n
+    avg_memory = total_memory / n
+    avg_exec   = total_exec   / n
+
+    peak_exec = max(r.executor_count  for r in rows)
+    peak_cpu  = max(r.cpu_millicores  for r in rows)
+
+    # Simulated cost: sum of per-interval costs
+    simulated_cost = sum(
+        cost_per_second(r.cpu_millicores, r.memory_mib) * interval_seconds
+        for r in rows
+    )
+
+    duration = n * interval_seconds
+
+    # Efficiency: average used vs. peak provisioned capacity
+    provisioned_cpu_millicores = peak_exec * 1000   # 1 vCPU per executor
+    provisioned_memory_mib     = peak_exec * 512    # 512 MiB per executor (approximated for all if 1 GiB wasn't requested effectively initially)
+    # The new app.py has pod_memory 512 or 1024, but keeping 512 as an estimation baseline for the efficiency ratio
+    
+    cpu_efficiency    = (avg_cpu    / provisioned_cpu_millicores * 100) if provisioned_cpu_millicores > 0 else 0.0
+    memory_efficiency = (avg_memory / provisioned_memory_mib     * 100) if provisioned_memory_mib     > 0 else 0.0
+
+    return CostSummary(
+        strategy               = strategy,
+        duration_seconds       = duration,
+        avg_executor_count     = avg_exec,
+        avg_cpu_millicores     = avg_cpu,
+        avg_memory_mib         = avg_memory,
+        peak_executor_count    = peak_exec,
+        peak_cpu_millicores    = peak_cpu,
+        simulated_cost_usd     = simulated_cost,
+        cpu_efficiency_pct     = cpu_efficiency,
+        memory_efficiency_pct  = memory_efficiency,
+    )
+
+
+def load_csv(filepath: str) -> List[MetricRow]:
+    """
+    Load a results CSV produced by run_experiment.sh into a list of MetricRow objects.
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Results file not found: {filepath}")
+
+    rows: List[MetricRow] = []
+    with open(filepath, newline="") as fh:
+        reader = csv.DictReader(fh)
+        required = {"timestamp", "strategy", "executor_count", "cpu_millicores", "memory_mib"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(
+                f"CSV missing required columns. Expected {required}, "
+                f"got {set(reader.fieldnames or [])}"
+            )
+        for line in reader:
+            rows.append(MetricRow(
+                timestamp      = int(line["timestamp"]),
+                strategy       = line["strategy"].strip().lower(),
+                executor_count = int(line["executor_count"]),
+                cpu_millicores = float(line["cpu_millicores"]),
+                memory_mib     = float(line["memory_mib"]),
+            ))
     return rows
 
-# ---------------------------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------------------------
-def analyse(rows: list[dict]) -> dict:
-    by_strategy = defaultdict(list)
+
+def compare_strategies(results_csv: str) -> List[CostSummary]:
+    """
+    Load a combined results CSV and return one CostSummary per strategy, sorted by cost.
+    """
+    rows = load_csv(results_csv)
+
+    by_strategy: dict = {}
     for row in rows:
-        by_strategy[row["strategy"]].append(row)
+        by_strategy.setdefault(row.strategy, []).append(row)
 
-    results = {}
-    for strategy, data in by_strategy.items():
-        data.sort(key=lambda r: r["timestamp"])
-
-        duration_s    = data[-1]["timestamp"] - data[0]["timestamp"]
-        avg_executors = sum(r["executor_count"] for r in data) / len(data)
-        max_executors = max(r["executor_count"] for r in data)
-        avg_cpu       = sum(r["cpu_millicores"] for r in data) / len(data)
-        peak_mem      = max(r["memory_mib"] for r in data)
-
-        # Simulated cost: integrate (executor_count × cost_per_pod) over time
-        cost = 0.0
-        for i in range(1, len(data)):
-            interval = data[i]["timestamp"] - data[i - 1]["timestamp"]
-            cost += data[i - 1]["executor_count"] * COST_PER_POD_SEC * interval
-
-        # Theoretical max cost (if always at max executors for full duration)
-        theoretical_max_cost = max_executors * COST_PER_POD_SEC * duration_s
-
-        results[strategy] = {
-            "duration_s":             duration_s,
-            "avg_executors":          round(avg_executors, 2),
-            "max_executors":          max_executors,
-            "avg_cpu_millicores":     round(avg_cpu),
-            "peak_memory_mib":        peak_mem,
-            "pod_memory_gib":         POD_MEMORY.get(strategy, "?"),
-            "simulated_cost_usd":     round(cost, 6),
-            "theoretical_max_cost":   round(theoretical_max_cost, 6),
-            "cost_efficiency_pct":    round(
-                (1 - cost / theoretical_max_cost) * 100, 1
-            ) if theoretical_max_cost > 0 else 0,
-        }
-    return results
-
-# ---------------------------------------------------------------------------
-# Printing
-# ---------------------------------------------------------------------------
-def print_table(results: dict) -> None:
-    strategies = [s for s in STRATEGY_ORDER if s in results]
-    col_w = 18
-
-    metrics = [
-        ("duration_s",           "Duration (s)",          "lower"),
-        ("avg_executors",        "Avg Executors",          "lower"),
-        ("max_executors",        "Max Executors",          "lower"),
-        ("avg_cpu_millicores",   "Avg CPU (millicores)",   "lower"),
-        ("peak_memory_mib",      "Peak Memory (MiB)",      "lower"),
-        ("pod_memory_gib",       "Pod Memory (GiB)",       None),
-        ("simulated_cost_usd",   "Simulated Cost ($)",     "lower"),
-        ("theoretical_max_cost", "Theoretical Max ($)",    None),
-        ("cost_efficiency_pct",  "Cost Saving vs Max (%)", "higher"),
+    summaries = [
+        compute_cost_summary(strategy_rows)
+        for strategy_rows in by_strategy.values()
     ]
 
-    header = f"{'Metric':<28}" + "".join(f"{STRATEGY_LABELS.get(s, s):>{col_w}}" for s in strategies)
-    print()
-    print("=" * len(header))
-    print(f"  AWS Cost Model  |  m5.xlarge on-demand us-east-1  |  ${M5_XLARGE_HOURLY}/hr per node")
-    print(f"  Pod cost: ${COST_PER_POD_HR:.4f}/hr each  |  1 vCPU / node's {VCPUS_PER_NODE} vCPUs")
-    print("=" * len(header))
-    print(header)
-    print("-" * len(header))
+    return sorted(summaries, key=lambda s: s.simulated_cost_usd)
 
-    for key, label, direction in metrics:
-        values = {s: results[s][key] for s in strategies}
-
-        if direction is None:
-            best = None
-        elif direction == "lower":
-            best = min(values, key=values.get)
-        else:
-            best = max(values, key=values.get)
-
-        def fmt(s: str, _values: dict = values, _best: str = best) -> str:
-            v = _values[s]
-            cell = f"★ {v}" if s == _best else str(v)
-            return f"{cell:>{col_w}}"
-
-        print(f"{label:<28}" + "".join(fmt(s) for s in strategies))
-
-    print("=" * len(header))
-    print()
-    print("★ = winner for that metric")
-    print()
-
-def print_warnings(rows: list[dict]) -> None:
+# ---------------------------------------------------------------------------
+# CLI Output Formatting
+# ---------------------------------------------------------------------------
+def print_warnings(rows: List[MetricRow]) -> None:
     """Warn if CPU/memory data is all zeros (metrics-server not installed)."""
-    all_cpu_zero = all(r["cpu_millicores"] == 0 for r in rows)
-    all_mem_zero = all(r["memory_mib"] == 0 for r in rows)
+    all_cpu_zero = all(r.cpu_millicores == 0 for r in rows)
+    all_mem_zero = all(r.memory_mib == 0 for r in rows)
     if all_cpu_zero or all_mem_zero:
         print()
         print("⚠️  WARNING: CPU/memory columns are all zero.")
@@ -167,22 +197,76 @@ def print_warnings(rows: list[dict]) -> None:
         print("   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml")
         print()
 
-def print_hypothesis(results: dict) -> None:
-    strategies = list(results.keys())
-    if len(strategies) < 2:
+
+def print_table(summaries: List[CostSummary]) -> None:
+    strategies_present = [s.strategy for s in summaries]
+    # Enforce order for column headers based on our preferred array, if present
+    ordered_summaries = []
+    for s_name in STRATEGY_ORDER:
+        matching = [s for s in summaries if s.strategy == s_name]
+        if matching:
+            ordered_summaries.append(matching[0])
+            
+    col_w = 18
+    metrics = [
+        ("duration_seconds",      "Duration (s)",          "lower"),
+        ("avg_executor_count",    "Avg Executors",          "lower"),
+        ("peak_executor_count",   "Peak Executors",         "lower"),
+        ("avg_cpu_millicores",    "Avg CPU (millicores)",   "lower"),
+        ("avg_memory_mib",        "Avg Memory (MiB)",       "lower"),
+        ("simulated_cost_usd",    "Simulated Cost ($)",     "lower"),
+        ("cpu_efficiency_pct",    "CPU Efficiency (%)",     "higher"),
+        ("memory_efficiency_pct", "Memory Efficiency (%)",  "higher"),
+    ]
+
+    header = f"{'Metric':<28}" + "".join(f"{STRATEGY_LABELS.get(s.strategy, s.strategy):>{col_w}}" for s in ordered_summaries)
+    print()
+    print("=" * len(header))
+    print(f"  AWS Cost Model  |  m5.xlarge on-demand us-east-1  |  ${M5_XLARGE_HOURLY}/hr per node")
+    print(f"  Cost uses dominant-resource billing (max of CPU/Memory fractional use of Node)")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    for key, label, direction in metrics:
+        values = {s.strategy: round(getattr(s, key), 4) if isinstance(getattr(s, key), float) else getattr(s, key) for s in ordered_summaries}
+
+        if direction is None:
+            best = None
+        elif direction == "lower":
+            best = min(values, key=values.get)
+        else:
+            best = max(values, key=values.get)
+
+        def fmt(s_name: str) -> str:
+            v = values[s_name]
+            cell = f"★ {v}" if s_name == best else str(v)
+            return f"{cell:>{col_w}}"
+
+        print(f"{label:<28}" + "".join(fmt(s.strategy) for s in ordered_summaries))
+
+    print("=" * len(header))
+    print()
+    print("★ = winner for that metric")
+    print()
+
+
+def print_hypothesis(summaries: List[CostSummary]) -> None:
+    if len(summaries) < 2:
         return
 
-    cheapest = min(strategies, key=lambda s: results[s]["simulated_cost_usd"])
-    fastest  = min(strategies, key=lambda s: results[s]["duration_s"])
-    leanest  = min(strategies, key=lambda s: results[s]["avg_executors"])
-    most_eff = max(strategies, key=lambda s: results[s]["cost_efficiency_pct"])
+    cheapest = min(summaries, key=lambda s: s.simulated_cost_usd)
+    fastest  = min(summaries, key=lambda s: s.duration_seconds)
+    leanest  = min(summaries, key=lambda s: s.avg_executor_count)
+    most_eff = max(summaries, key=lambda s: s.cpu_efficiency_pct)
 
     print("--- Interpretation ---")
-    print(f"  Most cost-efficient:        {STRATEGY_LABELS.get(cheapest, cheapest)}")
-    print(f"  Fastest job:                {STRATEGY_LABELS.get(fastest, fastest)}")
-    print(f"  Fewest avg pods (leanest):  {STRATEGY_LABELS.get(leanest, leanest)}")
-    print(f"  Best cost saving vs max:    {STRATEGY_LABELS.get(most_eff, most_eff)}")
+    print(f"  Most cost-efficient:        {STRATEGY_LABELS.get(cheapest.strategy, cheapest.strategy)}")
+    print(f"  Fastest job:                {STRATEGY_LABELS.get(fastest.strategy, fastest.strategy)}")
+    print(f"  Fewest avg pods (leanest):  {STRATEGY_LABELS.get(leanest.strategy, leanest.strategy)}")
+    print(f"  Best CPU efficiency:        {STRATEGY_LABELS.get(most_eff.strategy, most_eff.strategy)}")
     print()
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -197,6 +281,6 @@ if __name__ == "__main__":
 
     print_warnings(rows)
 
-    results  = analyse(rows)
-    print_table(results)
-    print_hypothesis(results)
+    summaries = compare_strategies(csv_path)
+    print_table(summaries)
+    print_hypothesis(summaries)

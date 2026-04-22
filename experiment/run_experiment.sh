@@ -16,6 +16,15 @@
 set -euo pipefail
 
 MODE="${1:-steam_heavy}"
+ENV="${2:-eks}"
+
+if [[ "$ENV" == "local" ]]; then
+  EXT=".yaml"
+  HPA_FILE="hpa.yaml"
+else
+  EXT="-eks.yaml"
+  HPA_FILE="hpa-eks.yaml"
+fi
 RESULTS_DIR="experiment/results"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 CSV_FILE="${RESULTS_DIR}/${TIMESTAMP}-${MODE}.csv"
@@ -156,7 +165,7 @@ run_dynamic() {
 
   # Patch the mode argument into the manifest
   sed "s/\"steam_heavy\"/\"${MODE}\"/" \
-    k8s/strategies/1-dynamic-allocation/spark-app.yaml \
+    k8s/strategies/1-dynamic-allocation/spark-app${EXT} \
     | kubectl apply -f -
 
   # Start background polling
@@ -175,7 +184,7 @@ run_dynamic() {
   echo "dynamic: duration=${duration}s" >> "$SUMMARY_FILE"
   log "Strategy 1 done. Duration: ${duration}s"
 
-  kubectl delete -f k8s/strategies/1-dynamic-allocation/spark-app.yaml --ignore-not-found
+  kubectl delete -f k8s/strategies/1-dynamic-allocation/spark-app${EXT} --ignore-not-found
   log "Cooling down 30s before next strategy..."
   sleep 30
 }
@@ -189,7 +198,7 @@ run_keda() {
   start_ts=$(date +%s)
 
   kubectl apply -f k8s/strategies/2-keda/spark-master.yaml
-  kubectl apply -f k8s/strategies/2-keda/spark-worker-deployment.yaml
+  kubectl apply -f k8s/strategies/2-keda/spark-worker-deployment${EXT}
   kubectl apply -f k8s/strategies/2-keda/keda-scaledobject.yaml
 
   log "Waiting for KEDA master to be ready..."
@@ -197,7 +206,7 @@ run_keda() {
 
   # Patch mode into job and apply
   sed "s/steam_heavy/${MODE}/" \
-    k8s/strategies/2-keda/spark-job.yaml \
+    k8s/strategies/2-keda/spark-job${EXT} \
     | kubectl apply -f -
 
   # Start background polling
@@ -215,9 +224,9 @@ run_keda() {
   echo "keda: duration=${duration}s" >> "$SUMMARY_FILE"
   log "Strategy 2 done. Duration: ${duration}s"
 
-  kubectl delete -f k8s/strategies/2-keda/spark-job.yaml --ignore-not-found
+  kubectl delete -f k8s/strategies/2-keda/spark-job${EXT} --ignore-not-found
   kubectl delete -f k8s/strategies/2-keda/keda-scaledobject.yaml --ignore-not-found
-  kubectl delete -f k8s/strategies/2-keda/spark-worker-deployment.yaml --ignore-not-found
+  kubectl delete -f k8s/strategies/2-keda/spark-worker-deployment${EXT} --ignore-not-found
   kubectl delete -f k8s/strategies/2-keda/spark-master.yaml --ignore-not-found
   log "Cooling down 30s before next strategy..."
   sleep 30
@@ -232,15 +241,15 @@ run_hpa() {
   start_ts=$(date +%s)
 
   kubectl apply -f k8s/strategies/3-hpa/spark-master.yaml
-  kubectl apply -f k8s/strategies/3-hpa/spark-worker-deployment.yaml
-  kubectl apply -f k8s/strategies/3-hpa/hpa.yaml
+  kubectl apply -f k8s/strategies/3-hpa/spark-worker-deployment${EXT}
+  kubectl apply -f k8s/strategies/3-hpa/${HPA_FILE}
 
   log "Waiting for HPA master to be ready..."
   kubectl rollout status deployment/spark-master-hpa --timeout=120s
 
   # Patch mode into job and apply
   sed "s/steam_heavy/${MODE}/" \
-    k8s/strategies/3-hpa/spark-job.yaml \
+    k8s/strategies/3-hpa/spark-job${EXT} \
     | kubectl apply -f -
 
   # Start background polling
@@ -258,9 +267,9 @@ run_hpa() {
   echo "hpa: duration=${duration}s" >> "$SUMMARY_FILE"
   log "Strategy 3 done. Duration: ${duration}s"
 
-  kubectl delete -f k8s/strategies/3-hpa/spark-job.yaml --ignore-not-found
-  kubectl delete -f k8s/strategies/3-hpa/hpa.yaml --ignore-not-found
-  kubectl delete -f k8s/strategies/3-hpa/spark-worker-deployment.yaml --ignore-not-found
+  kubectl delete -f k8s/strategies/3-hpa/spark-job${EXT} --ignore-not-found
+  kubectl delete -f k8s/strategies/3-hpa/${HPA_FILE} --ignore-not-found
+  kubectl delete -f k8s/strategies/3-hpa/spark-worker-deployment${EXT} --ignore-not-found
   kubectl delete -f k8s/strategies/3-hpa/spark-master.yaml --ignore-not-found
 }
 
