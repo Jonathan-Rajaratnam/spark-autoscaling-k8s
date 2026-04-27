@@ -20,6 +20,7 @@ SPARK_OPERATOR_VERSION="2.1.0"
 KUBE_PROMETHEUS_VERSION="72.6.2"
 KEDA_VERSION="2.17.1"
 PROMETHEUS_ADAPTER_VERSION="4.14.0"
+METRICS_SERVER_VERSION="3.12.2"
 
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
@@ -234,6 +235,7 @@ helm repo add aws-efs-csi-driver https://kubernetes-sigs.github.io/aws-efs-csi-d
 helm repo add spark-operator https://kubeflow.github.io/spark-operator 2>/dev/null || true
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
 helm repo add kedacore https://kedacore.github.io/charts 2>/dev/null || true
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ 2>/dev/null || true
 helm repo update
 
 helm upgrade --install aws-efs-csi-driver aws-efs-csi-driver/aws-efs-csi-driver \
@@ -247,6 +249,11 @@ helm upgrade --install spark-operator spark-operator/spark-operator \
 helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
     -f "${SCRIPT_DIR}/../k8s/monitoring/values-cloud.yaml" \
+    --wait --timeout 5m
+
+helm upgrade --install metrics-server metrics-server/metrics-server \
+    --namespace kube-system \
+    --version "${METRICS_SERVER_VERSION}" \
     --wait --timeout 5m
 
 helm upgrade --install keda kedacore/keda \

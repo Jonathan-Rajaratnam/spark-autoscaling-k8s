@@ -14,7 +14,8 @@
 #
 # Prerequisites:
 #   - kubectl configured and pointing at your local cluster
-#   - kube-prometheus-stack installed (for Prometheus)
+#   - metrics-server installed (for local and AWS CPU/memory fallback)
+#   - kube-prometheus-stack installed (for Prometheus; primary AWS CPU/memory source)
 #   - KEDA installed (for strategy 2)
 #   - Prometheus Adapter installed (for strategy 3)
 #   - curl (always available on macOS)
@@ -110,14 +111,35 @@ RESULTS_DIR="experiment/results"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 CSV_FILE="${RESULTS_DIR}/${TIMESTAMP}-${MODE}.csv"
 SUMMARY_FILE="${RESULTS_DIR}/${TIMESTAMP}-${MODE}-summary.txt"
+WARN_DIR="/tmp/spark_experiment_${TIMESTAMP}_warnings"
 
 mkdir -p "$RESULTS_DIR"
+mkdir -p "$WARN_DIR"
 echo "strategy,timestamp,executor_count,cpu_millicores,memory_mib" > "$CSV_FILE"
 echo -e "\nExperiment: mode=${MODE} env=${ENV} started=$(date)" > "$SUMMARY_FILE"
 
-log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
-WARNED_LOCAL_TOP=0
-WARNED_PROM_QUERY=0
+exec 3>&2
+log() { echo "[$(date +%H:%M:%S)] $*" >&3; }
+log_once() {
+  local key="$1"
+  shift
+  local marker="${WARN_DIR}/${key}.warned"
+  if [[ ! -f "$marker" ]]; then
+    : > "$marker"
+    log "$@"
+  fi
+}
+
+numeric_or_zero() {
+  local value="$1"
+  local field="$2"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value"
+    return 0
+  fi
+  log_once "non_numeric_${field}" "WARNING: Metric collector returned non-numeric ${field}; writing 0 for this sample"
+  echo 0
+}
 
 get_strategy_timeout() {
   local strategy="$1"
@@ -169,6 +191,7 @@ cleanup_strategy_resources() {
 # ---------------------------------------------------------------------------
 PROM_LOCAL="http://127.0.0.1:9091"
 PROM_PF_PID=""
+ACTIVE_POLL_PIDS=()
 
 start_prom_portforward() {
   log "Starting Prometheus port-forward on 127.0.0.1:9091..."
@@ -186,9 +209,18 @@ stop_prom_portforward() {
   fi
 }
 
+cleanup_background_work() {
+  rm -f /tmp/poll_dra.run /tmp/poll_keda.run /tmp/poll_hpa.run
+  for pid in "${ACTIVE_POLL_PIDS[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  stop_prom_portforward
+}
+
 
 # ---------------------------------------------------------------------------
-# prom_query <promql>  — returns the integer sum of all instant-query results
+# prom_query <promql>  — returns the integer sum of all instant-query results,
+# or __NO_DATA__ if Prometheus has no matching series yet.
 # ---------------------------------------------------------------------------
 prom_query() {
   local query="$1"
@@ -201,16 +233,53 @@ import sys,json
 data=json.load(sys.stdin)
 vals=[float(r['value'][1]) for r in data.get('data',{}).get('result',[])]
 print(int(sum(vals))) if vals else print('__NO_DATA__')
-" 2>/dev/null || echo 0)
+" 2>/dev/null || echo "__NO_DATA__")
   if [[ "$result" == "__NO_DATA__" ]]; then
-    if [[ "$WARNED_PROM_QUERY" -eq 0 ]]; then
-      log "WARNING: Prometheus returned no matching resource series; CPU/memory may show as 0"
-      WARNED_PROM_QUERY=1
-    fi
-    echo 0
+    log_once "prom_query_no_data" "WARNING: Prometheus returned no matching resource series"
+    echo "__NO_DATA__"
     return 0
   fi
   echo "$result"
+}
+
+prometheus_has_container_metrics() {
+  local result
+  result=$(prom_query 'count(container_memory_working_set_bytes{container!="",container!="POD"})')
+  [[ "$result" != "__NO_DATA__" && "$result" -gt 0 ]]
+}
+
+metrics_server_ready() {
+  kubectl top nodes --no-headers >/dev/null 2>&1
+}
+
+check_metrics_prerequisites() {
+  if [[ "$ENV" == "eks" ]]; then
+    log "Checking AWS metrics sources..."
+    local prom_ready=0
+    local top_ready=0
+
+    if prometheus_has_container_metrics; then
+      prom_ready=1
+      log "Prometheus container CPU/memory series are available"
+    else
+      log "WARNING: Prometheus has no container memory series yet"
+    fi
+
+    if metrics_server_ready; then
+      top_ready=1
+      log "Metrics Server is available via 'kubectl top'"
+    else
+      log "WARNING: Metrics Server is not ready; AWS fallback via 'kubectl top' is unavailable"
+    fi
+
+    if [[ "$prom_ready" -eq 0 && "$top_ready" -eq 0 ]]; then
+      log "ERROR: No usable CPU/memory metric source is available."
+      log "Install/repair metrics-server or kube-prometheus-stack before rerunning the experiment."
+      return 1
+    fi
+  elif ! metrics_server_ready; then
+    log "WARNING: Metrics Server is not ready; local CPU/memory columns may be zero"
+  fi
 }
 
 get_running_pod_names() {
@@ -245,10 +314,7 @@ sum_top_resources() {
   local output
 
   if ! output=$(kubectl top pods -l "${selector}" --no-headers 2>/dev/null); then
-    if [[ "$WARNED_LOCAL_TOP" -eq 0 ]]; then
-      log "WARNING: 'kubectl top pods' returned no data; install/verify metrics-server for local CPU/memory metrics"
-      WARNED_LOCAL_TOP=1
-    fi
+    log_once "kubectl_top_no_data" "WARNING: Metrics Server has no pod metrics for the active selector yet; waiting for fresh samples"
     echo 0
     return 0
   fi
@@ -303,6 +369,85 @@ print(int(total))
   fi
 }
 
+sum_prom_resources() {
+  local selector="$1"
+  local resource="$2"
+  local pod_regex
+  pod_regex=$(build_prom_pod_regex "$selector")
+
+  if [[ -z "$pod_regex" ]]; then
+    echo "__NO_DATA__"
+    return 0
+  fi
+
+  # Scope Prometheus queries to the currently running pods for the active strategy.
+  local prom_filter="namespace=\"default\",pod=~\"${pod_regex}\",container!=\"\",container!=\"POD\""
+  if [[ "$resource" == "cpu" ]]; then
+    prom_query "sum(rate(container_cpu_usage_seconds_total{${prom_filter}}[1m])) * 1000"
+  else
+    prom_query "sum(container_memory_working_set_bytes{${prom_filter}}) / 1048576"
+  fi
+}
+
+collect_eks_resources() {
+  local selector="$1"
+  local cpu_total
+  local mem_total
+
+  cpu_total=$(sum_prom_resources "$selector" "cpu")
+  mem_total=$(sum_prom_resources "$selector" "memory")
+
+  if [[ "$cpu_total" != "__NO_DATA__" && "$mem_total" != "__NO_DATA__" ]]; then
+    echo "${cpu_total},${mem_total}"
+    return 0
+  fi
+
+  log_once "eks_top_fallback" "WARNING: Prometheus has no series for the active pods yet; falling back to Metrics Server"
+
+  cpu_total=$(sum_top_resources "$selector" "cpu")
+  mem_total=$(sum_top_resources "$selector" "memory")
+  echo "${cpu_total},${mem_total}"
+}
+
+wait_for_pod_metrics() {
+  local selector="$1"
+  local timeout="${2:-180}"
+  local elapsed=0
+
+  log "Waiting for CPU/memory metrics for selector '${selector}' (timeout: ${timeout}s)..."
+  while [[ "$elapsed" -lt "$timeout" ]]; do
+    local running
+    running=$(kubectl get pods -l "${selector}" \
+      --field-selector=status.phase=Running \
+      --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ "$running" -gt 0 ]]; then
+      local cpu_total
+      local mem_total
+      if [[ "$ENV" == "eks" ]]; then
+        local resources
+        resources=$(collect_eks_resources "$selector")
+        cpu_total="${resources%,*}"
+        mem_total="${resources#*,}"
+      else
+        cpu_total=$(sum_top_resources "$selector" "cpu")
+        mem_total=$(sum_top_resources "$selector" "memory")
+      fi
+
+      if [[ "$cpu_total" =~ ^[0-9]+$ && "$mem_total" =~ ^[0-9]+$ && "$mem_total" -gt 0 ]]; then
+        log "Metrics ready for ${selector}: cpu=${cpu_total}m memory=${mem_total}Mi"
+        return 0
+      fi
+    fi
+
+    sleep 10
+    elapsed=$((elapsed + 10))
+  done
+
+  log "ERROR: Timed out waiting for non-zero CPU/memory metrics for '${selector}'"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # collect_metrics <strategy> <pod_selector>
 # Appends one CSV row. Local uses `kubectl top`; EKS uses Prometheus.
@@ -325,21 +470,15 @@ collect_metrics() {
     cpu_total=$(sum_top_resources "$selector" "cpu")
     mem_total=$(sum_top_resources "$selector" "memory")
   else
-    local pod_regex
-    pod_regex=$(build_prom_pod_regex "$selector")
-
-    if [[ -z "$pod_regex" ]]; then
-      cpu_total=0
-      mem_total=0
-    else
-      # Scope Prometheus queries to the currently running pods for the active strategy.
-      local prom_filter="namespace=\"default\",pod=~\"${pod_regex}\",container!=\"\",container!=\"POD\""
-      local cpu_query="sum(rate(container_cpu_usage_seconds_total{${prom_filter}}[1m])) * 1000"
-      local mem_query="sum(container_memory_working_set_bytes{${prom_filter}}) / 1048576"
-      cpu_total=$(prom_query "$cpu_query")
-      mem_total=$(prom_query "$mem_query")
-    fi
+    local resources
+    resources=$(collect_eks_resources "$selector")
+    cpu_total="${resources%,*}"
+    mem_total="${resources#*,}"
   fi
+
+  exec_count=$(numeric_or_zero "$exec_count" "executor_count")
+  cpu_total=$(numeric_or_zero "$cpu_total" "cpu_millicores")
+  mem_total=$(numeric_or_zero "$mem_total" "memory_mib")
 
   echo "${strategy},${ts},${exec_count},${cpu_total},${mem_total}" >> "${CSV_FILE}"
 }
@@ -430,6 +569,13 @@ poll_metrics() {
   done
 }
 
+stop_polling() {
+  local strategy="$1"
+  local poll_pid="$2"
+  rm -f "/tmp/poll_${strategy}.run"
+  wait "$poll_pid" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # STRATEGY 1 — Dynamic Allocation via SparkApplication CRD
 # ---------------------------------------------------------------------------
@@ -446,15 +592,20 @@ run_dynamic() {
     k8s/strategies/1-dynamic-allocation/spark-app${EXT} \
     | kubectl apply -f -
 
+  wait_for_pod_metrics "app-role=spark-executor,strategy=dynamic-allocation" 180
+
   # Start background polling
   poll_metrics "dra" "app-role=spark-executor,strategy=dynamic-allocation" 10 &
   local poll_pid=$!
+  ACTIVE_POLL_PIDS+=("$poll_pid")
 
-  wait_for_sparkapplication "spark-app-dynamic" "$timeout"
+  if ! wait_for_sparkapplication "spark-app-dynamic" "$timeout"; then
+    stop_polling "dra" "$poll_pid"
+    cleanup_strategy_resources "dynamic"
+    return 1
+  fi
 
-  # Stop polling
-  rm -f /tmp/poll_dra.run
-  wait "$poll_pid" 2>/dev/null || true
+  stop_polling "dra" "$poll_pid"
 
   local end_ts
   end_ts=$(date +%s)
@@ -493,14 +644,20 @@ run_keda() {
     k8s/strategies/2-keda/spark-job${EXT} \
     | kubectl apply -f -
 
+  wait_for_pod_metrics "app=spark-worker,strategy=keda" 180
+
   # Start background polling
   poll_metrics "keda" "app=spark-worker,strategy=keda" 10 &
   local poll_pid=$!
+  ACTIVE_POLL_PIDS+=("$poll_pid")
 
-  wait_for_job "spark-submit-keda" "$timeout"
+  if ! wait_for_job "spark-submit-keda" "$timeout"; then
+    stop_polling "keda" "$poll_pid"
+    cleanup_strategy_resources "keda"
+    return 1
+  fi
 
-  rm -f /tmp/poll_keda.run
-  wait "$poll_pid" 2>/dev/null || true
+  stop_polling "keda" "$poll_pid"
 
   local end_ts
   end_ts=$(date +%s)
@@ -539,14 +696,20 @@ run_hpa() {
     k8s/strategies/3-hpa/spark-job${EXT} \
     | kubectl apply -f -
 
+  wait_for_pod_metrics "app=spark-worker,strategy=hpa" 180
+
   # Start background polling
   poll_metrics "hpa" "app=spark-worker,strategy=hpa" 10 &
   local poll_pid=$!
+  ACTIVE_POLL_PIDS+=("$poll_pid")
 
-  wait_for_job "spark-submit-hpa" "$timeout"
+  if ! wait_for_job "spark-submit-hpa" "$timeout"; then
+    stop_polling "hpa" "$poll_pid"
+    cleanup_strategy_resources "hpa"
+    return 1
+  fi
 
-  rm -f /tmp/poll_hpa.run
-  wait "$poll_pid" 2>/dev/null || true
+  stop_polling "hpa" "$poll_pid"
 
   local end_ts
   end_ts=$(date +%s)
@@ -560,12 +723,13 @@ run_hpa() {
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
-trap stop_prom_portforward EXIT
+trap cleanup_background_work EXIT
 
 log "Starting benchmark experiment: mode=${MODE}, env=${ENV}"
 log "Results will be saved to: ${CSV_FILE}"
 
 start_prom_portforward
+check_metrics_prerequisites
 
 run_dynamic
 run_keda

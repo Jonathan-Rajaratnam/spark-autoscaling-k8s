@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efs-fix-perms
+  namespace: default
+  labels:
+    app: efs-fix-perms
+spec:
+  restartPolicy: Never
+  containers:
+    - name: shell
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsUser: 0
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: spark-data-pvc

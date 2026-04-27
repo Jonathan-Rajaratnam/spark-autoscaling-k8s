@@ -111,6 +111,7 @@
             "axisColorMode": "text",
             "axisLabel": "",
             "axisPlacement": "auto",
+            "axisSoftMin": 0,
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
@@ -399,6 +400,6 @@
   "timezone": "browser",
   "title": "Spark DRA Dashboard",
   "uid": "dra8292",
-  "version": 7,
+  "version": 1,
   "weekStart": ""
 }
