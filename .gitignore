@@ -213,3 +213,6 @@ docs/
 experiment/results/
 
 *.tar
+
+/misc/*
+

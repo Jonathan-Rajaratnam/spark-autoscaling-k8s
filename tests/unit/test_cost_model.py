@@ -17,7 +17,7 @@ import pytest
 exp_dir = os.path.join(os.path.dirname(__file__), "../../experiment")
 sys.path.insert(0, os.path.abspath(exp_dir))
 from cost_model import (
-    M5_XLARGE_HOURLY,
+    M7I_FLEX_LARGE_HOURLY,
     SECONDS_PER_HOUR,
     CostSummary,
     MetricRow,
@@ -38,31 +38,31 @@ class TestCostPerSecond:
         assert cost_per_second(0.0, 0.0) == 0.0
 
     def test_full_node_cpu_costs_one_node_per_second(self):
-        """TC-U02 | FR5 | 4000 millicores (full m5.xlarge) = 1 node/s cost."""
-        expected = M5_XLARGE_HOURLY / SECONDS_PER_HOUR
-        result = cost_per_second(4000.0, 0.0)
+        """TC-U02 | FR5 | 2000 millicores (full m7i-flex.large) = 1 node/s cost."""
+        expected = M7I_FLEX_LARGE_HOURLY / SECONDS_PER_HOUR
+        result = cost_per_second(2000.0, 0.0)
         assert abs(result - expected) < 1e-10, \
             f"Expected {expected:.10f}, got {result:.10f}"
 
     def test_half_node_cpu_halves_cost(self):
-        """TC-U03 | FR5 | 2000 millicores = half a node = half the cost."""
-        full  = cost_per_second(4000.0, 0.0)
-        half  = cost_per_second(2000.0, 0.0)
+        """TC-U03 | FR5 | 1000 millicores = half a node = half the cost."""
+        full  = cost_per_second(2000.0, 0.0)
+        half  = cost_per_second(1000.0, 0.0)
         assert abs(half - full / 2) < 1e-10
 
     def test_dominant_resource_billing_memory(self):
         """TC-U04 | FR5 | Memory-dominant workload bills on memory fraction."""
-        # 100 millicores CPU (2.5% of node) vs 8192 MiB memory (50% of node)
+        # 100 millicores CPU (5% of node) vs 4096 MiB memory (50% of node)
         # memory dominates → cost should equal 50% of node/s rate
-        expected = (8192 / 16384) * (M5_XLARGE_HOURLY / SECONDS_PER_HOUR)
-        result = cost_per_second(100.0, 8192.0)
+        expected = (4096 / 8192) * (M7I_FLEX_LARGE_HOURLY / SECONDS_PER_HOUR)
+        result = cost_per_second(100.0, 4096.0)
         assert abs(result - expected) < 1e-10
 
     def test_dominant_resource_billing_cpu(self):
         """TC-U05 | FR5 | CPU-dominant workload bills on CPU fraction."""
-        # 3000 millicores (75%) vs 512 MiB memory (3.1%)
-        expected = (3000 / 4000) * (M5_XLARGE_HOURLY / SECONDS_PER_HOUR)
-        result = cost_per_second(3000.0, 512.0)
+        # 1500 millicores (75%) vs 512 MiB memory (6.25%)
+        expected = (1500 / 2000) * (M7I_FLEX_LARGE_HOURLY / SECONDS_PER_HOUR)
+        result = cost_per_second(1500.0, 512.0)
         assert abs(result - expected) < 1e-10
 
     def test_negative_cpu_raises(self):
