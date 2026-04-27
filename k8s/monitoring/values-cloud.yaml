@@ -1,0 +1,15 @@
+grafana:
+  enabled: true
+  adminUser: jonathan
+  adminPassword: spark-test-fyp
+  persistence:
+    enabled: false
+  service:
+    type: ClusterIP
+  defaultDashboardsEnabled: true
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false

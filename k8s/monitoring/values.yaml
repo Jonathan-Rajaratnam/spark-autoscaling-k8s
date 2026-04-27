@@ -1,5 +1,12 @@
 grafana:
   enabled: true
+  persistence:
+    enabled: true
+    type: pvc
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+
 
   adminUser: admin
   adminPassword: admin  # OK for local & FYP (change in cloud later)

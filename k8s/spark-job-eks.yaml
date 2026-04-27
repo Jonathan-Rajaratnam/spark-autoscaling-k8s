@@ -9,7 +9,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: spark
-          image: jonathan/spark-app:1.5
+          image: jonathanr08/spark-app:1.7
           imagePullPolicy: IfNotPresent
           command:
             - /opt/spark/bin/spark-submit
