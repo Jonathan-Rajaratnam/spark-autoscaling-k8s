@@ -246,8 +246,7 @@ helm upgrade --install spark-operator spark-operator/spark-operator \
 
 helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
-    --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-    --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
+    -f "${SCRIPT_DIR}/../k8s/monitoring/values-cloud.yaml" \
     --wait --timeout 5m
 
 helm upgrade --install keda kedacore/keda \
