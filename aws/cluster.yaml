@@ -4,7 +4,7 @@ kind: ClusterConfig
 metadata:
   name: spark-benchmark-cluster
   region: us-east-1
-  version: "1.30"
+  version: "1.33"
 
 iam:
   withOIDC: true
@@ -12,8 +12,8 @@ iam:
 managedNodeGroups:
   - name: spark-nodes
     instanceType: m7i-flex.large
-    desiredCapacity: 4
-    minSize: 4
+    desiredCapacity: 1
+    minSize: 0
     maxSize: 4
     volumeSize: 100
 

@@ -16,11 +16,13 @@ SG_NAME="efs-sg-spark"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Helm chart versions — pin to prevent breaking upgrades
-SPARK_OPERATOR_VERSION="2.1.0"
-KUBE_PROMETHEUS_VERSION="72.6.2"
-KEDA_VERSION="2.17.1"
-PROMETHEUS_ADAPTER_VERSION="4.14.0"
-METRICS_SERVER_VERSION="3.12.2"
+AWS_EFS_CSI_DRIVER_VERSION="4.0.1"
+SPARK_OPERATOR_VERSION="2.5.0"
+KUBE_PROMETHEUS_VERSION="83.7.0"
+KEDA_VERSION="2.19.0"
+PROMETHEUS_ADAPTER_VERSION="5.3.0"
+METRICS_SERVER_VERSION="3.13.0"
+METRICS_SERVER_IMAGE_TAG="v0.8.1"
 
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
@@ -239,29 +241,46 @@ helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ 2
 helm repo update
 
 helm upgrade --install aws-efs-csi-driver aws-efs-csi-driver/aws-efs-csi-driver \
-    --namespace kube-system
+    --namespace kube-system \
+    --version "${AWS_EFS_CSI_DRIVER_VERSION}" \
+    --wait --timeout 5m
 
 helm upgrade --install spark-operator spark-operator/spark-operator \
     --namespace spark-operator --create-namespace \
+    --version "${SPARK_OPERATOR_VERSION}" \
     --set webhook.enable=true \
     --wait --timeout 5m
 
 helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
+    --version "${KUBE_PROMETHEUS_VERSION}" \
     -f "${SCRIPT_DIR}/../k8s/monitoring/values-cloud.yaml" \
     --wait --timeout 5m
 
-helm upgrade --install metrics-server metrics-server/metrics-server \
-    --namespace kube-system \
-    --version "${METRICS_SERVER_VERSION}" \
-    --wait --timeout 5m
+if helm status metrics-server --namespace kube-system &>/dev/null; then
+    helm upgrade metrics-server metrics-server/metrics-server \
+        --namespace kube-system \
+        --version "${METRICS_SERVER_VERSION}" \
+        --set "image.tag=${METRICS_SERVER_IMAGE_TAG}" \
+        --wait --timeout 5m
+elif kubectl get deployment metrics-server --namespace kube-system &>/dev/null; then
+    warn "Metrics Server already exists but is not managed by Helm — leaving current deployment in place."
+else
+    helm install metrics-server metrics-server/metrics-server \
+        --namespace kube-system \
+        --version "${METRICS_SERVER_VERSION}" \
+        --set "image.tag=${METRICS_SERVER_IMAGE_TAG}" \
+        --wait --timeout 5m
+fi
 
 helm upgrade --install keda kedacore/keda \
     --namespace keda --create-namespace \
+    --version "${KEDA_VERSION}" \
     --wait --timeout 5m
 
 helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
     --namespace monitoring \
+    --version "${PROMETHEUS_ADAPTER_VERSION}" \
     -f "${SCRIPT_DIR}/../k8s/strategies/3-hpa/prometheus-adapter-values.yaml" \
     --wait --timeout 5m
 
