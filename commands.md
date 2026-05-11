@@ -35,10 +35,18 @@ experiment/results/<timestamp>-<mode>.csv
 experiment/results/<timestamp>-<mode>-summary.txt
 ```
 
+Check required local datasets:
+
+```bash
+./scripts/check-data.sh
+./scripts/check-data.sh --require-property
+```
+
 ## Build and Test
 
 ```bash
-docker build -t jonathanr08/spark-app:1.7 .
+source scripts/config.sh
+docker build -t "$SPARK_APP_IMAGE" .
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pytest tests/ -v
@@ -50,7 +58,53 @@ python3 -m venv .venv
 For EKS, push the image before running jobs:
 
 ```bash
-docker push jonathanr08/spark-app:1.7
+docker push "$SPARK_APP_IMAGE"
+```
+
+Shared defaults are in `scripts/config.sh`; copy `.env.example` to `.env` when you want local overrides.
+
+## Local Helm Installs
+
+```bash
+source scripts/config.sh
+
+helm repo add spark-operator https://kubeflow.github.io/spark-operator
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm repo update
+
+helm upgrade --install spark-operator spark-operator/spark-operator \
+  --namespace spark-operator \
+  --create-namespace \
+  --version "$SPARK_OPERATOR_VERSION" \
+  --set webhook.enable=true \
+  --wait
+
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  --version "$KUBE_PROMETHEUS_VERSION" \
+  -f k8s/monitoring/values.yaml \
+  --wait
+
+helm upgrade --install metrics-server metrics-server/metrics-server \
+  --namespace kube-system \
+  --version "$METRICS_SERVER_VERSION" \
+  --set "image.tag=$METRICS_SERVER_IMAGE_TAG" \
+  --wait
+
+helm upgrade --install keda kedacore/keda \
+  --namespace keda \
+  --create-namespace \
+  --version "$KEDA_VERSION" \
+  --wait
+
+helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
+  --namespace monitoring \
+  --version "$PROMETHEUS_ADAPTER_VERSION" \
+  -f k8s/strategies/3-hpa/prometheus-adapter-values.yaml \
+  --wait
 ```
 
 ## RBAC
@@ -264,6 +318,18 @@ Provision EKS/EFS and install dependencies:
 
 ```bash
 ./aws/setup-aws.sh
+```
+
+Provision AWS infrastructure without uploading datasets:
+
+```bash
+SKIP_DATA_UPLOAD=1 ./aws/setup-aws.sh
+```
+
+Require the large `property_prices` dataset during AWS setup:
+
+```bash
+REQUIRE_PROPERTY_DATA=1 ./aws/setup-aws.sh
 ```
 
 Run an EKS benchmark:

@@ -18,9 +18,22 @@
 #   - kube-prometheus-stack installed (for Prometheus; primary AWS CPU/memory source)
 #   - KEDA installed (for strategy 2)
 #   - Prometheus Adapter installed (for strategy 3)
+#   - perl (used to render configured image/PVC/mode into manifests)
 #   - curl (always available on macOS)
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  set -a
+  source "${REPO_ROOT}/.env"
+  set +a
+fi
+
+source "${REPO_ROOT}/scripts/config.sh"
+cd "${REPO_ROOT}"
 
 kubectl() {
   if [[ -n "${KUBE_CONTEXT:-}" ]]; then
@@ -128,6 +141,24 @@ log_once() {
     : > "$marker"
     log "$@"
   fi
+}
+
+render_manifest() {
+  local manifest="$1"
+  SPARK_APP_IMAGE="${SPARK_APP_IMAGE}" \
+  SPARK_DATA_PVC="${SPARK_DATA_PVC}" \
+  MODE="${MODE}" \
+    perl -pe '
+      s#image:\s*(?:jonathanr08/spark-app:1\.7|jonathan/spark-app:1\.5)#image: $ENV{SPARK_APP_IMAGE}#g;
+      s#claimName:\s*spark-data-pvc#claimName: $ENV{SPARK_DATA_PVC}#g;
+      s#"steam_heavy"#"$ENV{MODE}"#g;
+      s#^(\s*-\s*)steam_heavy(\s*(?:\#.*)?)$#$1$ENV{MODE}$2#g;
+    ' "$manifest"
+}
+
+apply_manifest() {
+  local manifest="$1"
+  render_manifest "$manifest" | kubectl apply -f -
 }
 
 numeric_or_zero() {
@@ -587,10 +618,7 @@ run_dynamic() {
   start_ts=$(date +%s)
   timeout=$(get_strategy_timeout "dynamic")
 
-  # Patch the mode argument into the manifest
-  sed "s/\"steam_heavy\"/\"${MODE}\"/" \
-    k8s/strategies/1-dynamic-allocation/spark-app${EXT} \
-    | kubectl apply -f -
+  apply_manifest "k8s/strategies/1-dynamic-allocation/spark-app${EXT}"
 
   wait_for_pod_metrics "app-role=spark-executor,strategy=dynamic-allocation" 180
 
@@ -629,20 +657,17 @@ run_keda() {
   start_ts=$(date +%s)
   timeout=$(get_strategy_timeout "keda")
 
-  kubectl apply -f k8s/strategies/2-keda/spark-master.yaml
-  kubectl apply -f k8s/strategies/2-keda/spark-worker-deployment${EXT}
-  kubectl apply -f k8s/strategies/2-keda/keda-scaledobject.yaml
+  apply_manifest "k8s/strategies/2-keda/spark-master.yaml"
+  apply_manifest "k8s/strategies/2-keda/spark-worker-deployment${EXT}"
+  apply_manifest "k8s/strategies/2-keda/keda-scaledobject.yaml"
 
   log "Waiting for KEDA master to be ready..."
   kubectl rollout status deployment/spark-master-keda --timeout=120s
   log "Waiting for KEDA workers to be ready..."
   kubectl rollout status deployment/spark-worker-keda --timeout=120s
 
-  # Patch mode into job and apply
   kubectl delete job/spark-submit-keda --ignore-not-found >/dev/null 2>&1 || true
-  sed "s/steam_heavy/${MODE}/" \
-    k8s/strategies/2-keda/spark-job${EXT} \
-    | kubectl apply -f -
+  apply_manifest "k8s/strategies/2-keda/spark-job${EXT}"
 
   wait_for_pod_metrics "app=spark-worker,strategy=keda" 180
 
@@ -681,20 +706,17 @@ run_hpa() {
   start_ts=$(date +%s)
   timeout=$(get_strategy_timeout "hpa")
 
-  kubectl apply -f k8s/strategies/3-hpa/spark-master.yaml
-  kubectl apply -f k8s/strategies/3-hpa/spark-worker-deployment${EXT}
-  kubectl apply -f k8s/strategies/3-hpa/${HPA_FILE}
+  apply_manifest "k8s/strategies/3-hpa/spark-master.yaml"
+  apply_manifest "k8s/strategies/3-hpa/spark-worker-deployment${EXT}"
+  apply_manifest "k8s/strategies/3-hpa/${HPA_FILE}"
 
   log "Waiting for HPA master to be ready..."
   kubectl rollout status deployment/spark-master-hpa --timeout=120s
   log "Waiting for HPA workers to be ready..."
   kubectl rollout status deployment/spark-worker-hpa --timeout=120s
 
-  # Patch mode into job and apply
   kubectl delete job/spark-submit-hpa --ignore-not-found >/dev/null 2>&1 || true
-  sed "s/steam_heavy/${MODE}/" \
-    k8s/strategies/3-hpa/spark-job${EXT} \
-    | kubectl apply -f -
+  apply_manifest "k8s/strategies/3-hpa/spark-job${EXT}"
 
   wait_for_pod_metrics "app=spark-worker,strategy=hpa" 180
 

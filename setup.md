@@ -25,6 +25,12 @@ For local CPU and memory collection, install Metrics Server in your cluster. For
 
 For local tests, `run_tests.sh` expects Java 17 from Homebrew at `/opt/homebrew/Cellar/openjdk@17/17.0.18/libexec/openjdk.jdk/Contents/Home` and a project virtual environment at `.venv/`.
 
+Shared defaults live in `scripts/config.sh`, and optional local overrides can go in `.env` using `.env.example` as a starting point. Source the config before running the local Helm commands below:
+
+```bash
+source scripts/config.sh
+```
+
 ## Data Layout
 
 The manifests expect datasets under the repository `data/` directory:
@@ -42,6 +48,15 @@ data/
 
 Local manifests mount `/Users/jonathan/Docs/spark-app/data` into containers as `/data` using `hostPath`. EKS manifests mount the `spark-data-pvc` EFS volume as `/data`.
 
+Check the local data layout before running jobs:
+
+```bash
+./scripts/check-data.sh
+
+# Also require the large Land Registry file
+./scripts/check-data.sh --require-property
+```
+
 ## Local Setup
 
 ### 1. Install the Spark Operator
@@ -53,6 +68,7 @@ helm repo update
 helm upgrade --install spark-operator spark-operator/spark-operator \
   --namespace spark-operator \
   --create-namespace \
+  --version "$SPARK_OPERATOR_VERSION" \
   --set webhook.enable=true \
   --wait
 ```
@@ -61,23 +77,23 @@ The repo uses `SparkApplication` manifests with API version `sparkoperator.k8s.i
 
 ### 2. Build the Docker Image
 
-The current strategy manifests use `jonathanr08/spark-app:1.7`.
+The current strategy manifests use the image configured as `SPARK_APP_IMAGE`.
 
 ```bash
-docker build -t jonathanr08/spark-app:1.7 .
+docker build -t "$SPARK_APP_IMAGE" .
 ```
 
 If you use Minikube, build inside Minikube's Docker daemon:
 
 ```bash
 eval "$(minikube docker-env)"
-docker build -t jonathanr08/spark-app:1.7 .
+docker build -t "$SPARK_APP_IMAGE" .
 ```
 
 If you use Kind, load the image after building:
 
 ```bash
-kind load docker-image jonathanr08/spark-app:1.7
+kind load docker-image "$SPARK_APP_IMAGE"
 ```
 
 Docker Desktop and OrbStack normally make locally built images available to the local Kubernetes cluster.
@@ -99,11 +115,25 @@ helm repo update
 helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
   --namespace monitoring \
   --create-namespace \
+  --version "$KUBE_PROMETHEUS_VERSION" \
   -f k8s/monitoring/values.yaml \
   --wait
 
 kubectl apply -f k8s/monitoring/spark-servicemonitor.yaml
 kubectl apply -f k8s/monitoring/spark-metrics-service.yaml
+```
+
+Install Metrics Server locally if your Kubernetes distribution does not already provide it:
+
+```bash
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm repo update
+
+helm upgrade --install metrics-server metrics-server/metrics-server \
+  --namespace kube-system \
+  --version "$METRICS_SERVER_VERSION" \
+  --set "image.tag=$METRICS_SERVER_IMAGE_TAG" \
+  --wait
 ```
 
 Grafana is configured by `k8s/monitoring/values.yaml`:
@@ -134,6 +164,7 @@ helm repo update
 helm upgrade --install keda kedacore/keda \
   --namespace keda \
   --create-namespace \
+  --version "$KEDA_VERSION" \
   --wait
 ```
 
@@ -142,6 +173,7 @@ helm upgrade --install keda kedacore/keda \
 ```bash
 helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
   --namespace monitoring \
+  --version "$PROMETHEUS_ADAPTER_VERSION" \
   -f k8s/strategies/3-hpa/prometheus-adapter-values.yaml \
   --wait
 ```
@@ -206,13 +238,16 @@ Install and configure:
 - Docker
 - `perl`
 
+You can override setup values by exporting variables or creating a local `.env` file. The AWS script reads `.env` first and then applies defaults from `scripts/config.sh`.
+
 ### 1. Build and Push the Image
 
-The EKS manifests pull `jonathanr08/spark-app:1.7`, so the image must exist in the registry before jobs start.
+The EKS manifests pull `SPARK_APP_IMAGE`, so the image must exist in the registry before jobs start.
 
 ```bash
-docker build -t jonathanr08/spark-app:1.7 .
-docker push jonathanr08/spark-app:1.7
+source scripts/config.sh
+docker build -t "$SPARK_APP_IMAGE" .
+docker push "$SPARK_APP_IMAGE"
 ```
 
 ### 2. Provision EKS, EFS, Monitoring, and Autoscalers
@@ -231,6 +266,20 @@ The script provisions:
 - Prometheus Adapter chart version `5.3.0`.
 - Metrics Server chart version `3.13.0` with image tag `v0.8.1`.
 - Dataset upload into EFS at `/data`.
+
+The cluster currently stays on Kubernetes `1.33` by design. The setup script warns that this version is expected to enter extended support in July 2026, but it does not change the cluster version.
+
+Dataset upload behavior:
+
+```bash
+# Provision infrastructure without copying datasets
+SKIP_DATA_UPLOAD=1 ./aws/setup-aws.sh
+
+# Require the large Land Registry file for property_prices mode
+REQUIRE_PROPERTY_DATA=1 ./aws/setup-aws.sh
+```
+
+By default, the script requires the three Steam CSVs in `data/games/`, warns if `data/input/land-data.csv` is missing, and still finishes so Steam modes can run.
 
 ### 3. Run the EKS Benchmark
 

@@ -9,20 +9,18 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
-CLUSTER_NAME="spark-benchmark-cluster"
-AWS_REGION="us-east-1"
-EFS_NAME="spark-benchmark-efs"
-SG_NAME="efs-sg-spark"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Helm chart versions — pin to prevent breaking upgrades
-AWS_EFS_CSI_DRIVER_VERSION="4.0.1"
-SPARK_OPERATOR_VERSION="2.5.0"
-KUBE_PROMETHEUS_VERSION="83.7.0"
-KEDA_VERSION="2.19.0"
-PROMETHEUS_ADAPTER_VERSION="5.3.0"
-METRICS_SERVER_VERSION="3.13.0"
-METRICS_SERVER_IMAGE_TAG="v0.8.1"
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    source "${REPO_ROOT}/.env"
+    set +a
+fi
+
+source "${REPO_ROOT}/scripts/config.sh"
+
+SG_NAME="${EFS_SECURITY_GROUP_NAME}"
 
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
@@ -49,9 +47,108 @@ echo "=================================================="
 echo "    AWS EKS & EFS Automation Setup"
 echo "=================================================="
 
-for cmd in eksctl aws kubectl helm perl; do
+require_command() {
+    local cmd="$1"
     command -v "$cmd" &>/dev/null || fail "${cmd} is required but not found. Please install it."
-done
+}
+
+is_enabled() {
+    case "${1:-0}" in
+        1|true|TRUE|yes|YES|y|Y) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+preflight_commands() {
+    info "Preflight: checking required command line tools..."
+    for cmd in eksctl aws kubectl helm perl docker; do
+        require_command "$cmd"
+    done
+    ok "Required command line tools are installed."
+}
+
+preflight_aws_identity() {
+    info "Preflight: checking AWS credentials..."
+    local account
+    account=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
+        || fail "AWS credentials are not configured or cannot call sts:GetCallerIdentity."
+    ok "AWS account: ${account}; region: ${AWS_REGION}"
+}
+
+preflight_docker() {
+    info "Preflight: checking Docker..."
+    if ! docker info &>/dev/null; then
+        fail "Docker is installed but not running. Start Docker before building or pushing ${SPARK_APP_IMAGE}."
+    fi
+    if docker image inspect "${SPARK_APP_IMAGE}" &>/dev/null; then
+        ok "Local image found: ${SPARK_APP_IMAGE}"
+    else
+        warn "Local image not found: ${SPARK_APP_IMAGE}"
+        warn "Build and push it before running Spark jobs: docker build -t ${SPARK_APP_IMAGE} . && docker push ${SPARK_APP_IMAGE}"
+    fi
+}
+
+preflight_cluster_version() {
+    info "Preflight: checking requested EKS Kubernetes version..."
+    local file_version
+    file_version=$(perl -ne 'print "$1\n" if /^\s*version:\s*"([^"]+)"/' "${SCRIPT_DIR}/cluster.yaml" | head -n 1)
+    if [[ "${file_version}" != "${EKS_KUBERNETES_VERSION}" ]]; then
+        fail "scripts/config.sh has EKS_KUBERNETES_VERSION=${EKS_KUBERNETES_VERSION}, but aws/cluster.yaml uses ${file_version}."
+    fi
+    if [[ "${EKS_KUBERNETES_VERSION}" == "1.33" ]]; then
+        warn "Keeping EKS Kubernetes ${EKS_KUBERNETES_VERSION}; it is expected to enter extended support in July 2026."
+    fi
+    ok "EKS Kubernetes version: ${EKS_KUBERNETES_VERSION}"
+}
+
+preflight_data() {
+    if is_enabled "${SKIP_DATA_UPLOAD}"; then
+        warn "SKIP_DATA_UPLOAD=${SKIP_DATA_UPLOAD}; AWS setup will provision infrastructure without copying datasets."
+        return 0
+    fi
+
+    info "Preflight: checking local datasets before EFS upload..."
+    local missing=()
+    local file
+    for file in "${STEAM_DATA_FILES[@]}"; do
+        [[ -f "${REPO_ROOT}/${STEAM_DATA_DIR}/${file}" ]] || missing+=("${STEAM_DATA_DIR}/${file}")
+    done
+
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        printf '  Missing required Steam dataset files:\n' >&2
+        printf '    - %s\n' "${missing[@]}" >&2
+        fail "Add the Steam CSV files under ${STEAM_DATA_DIR}/, or rerun with SKIP_DATA_UPLOAD=1 to provision infrastructure only."
+    fi
+
+    if [[ -f "${REPO_ROOT}/${PROPERTY_DATA_FILE}" ]]; then
+        ok "Property dataset found: ${PROPERTY_DATA_FILE}"
+    elif is_enabled "${REQUIRE_PROPERTY_DATA}"; then
+        fail "Property dataset is required but missing: ${PROPERTY_DATA_FILE}"
+    else
+        warn "Property dataset missing: ${PROPERTY_DATA_FILE}"
+        warn "AWS setup will still finish, but property_prices mode will not work until you upload that file."
+    fi
+
+    ok "Required Steam datasets are present."
+}
+
+preflight_summary() {
+    info "Preflight configuration summary"
+    echo "  Cluster:          ${CLUSTER_NAME}"
+    echo "  Region:           ${AWS_REGION}"
+    echo "  Kubernetes:       ${EKS_KUBERNETES_VERSION}"
+    echo "  Image:            ${SPARK_APP_IMAGE}"
+    echo "  Data directory:   ${DATA_DIR}"
+    echo "  PVC:              ${SPARK_DATA_PVC}"
+    echo "  Skip data upload: ${SKIP_DATA_UPLOAD}"
+}
+
+preflight_commands
+preflight_aws_identity
+preflight_docker
+preflight_cluster_version
+preflight_data
+preflight_summary
 
 # ── 1. EKS Cluster (idempotent) ─────────────────────────────────────────────
 CURRENT_STEP="1-eks-cluster"
@@ -220,12 +317,14 @@ info "6. Applying EFS StorageClass and PVC..."
 
 echo "Cleaning out broken dynamic PVC configs..."
 kubectl delete storageclass efs-sc --ignore-not-found 2>/dev/null || true
-kubectl delete pvc spark-data-pvc --ignore-not-found 2>/dev/null || true
+kubectl delete pvc "${SPARK_DATA_PVC}" --ignore-not-found 2>/dev/null || true
 kubectl delete persistentvolume efs-pv --ignore-not-found 2>/dev/null || true
 
 perl -pe "s/FILE_SYSTEM_ID/${EFS_ID}/g" "${SCRIPT_DIR}/efs-pv.yaml" \
     | kubectl apply -f -
-kubectl apply -f "${SCRIPT_DIR}/efs-pvc.yaml"
+SPARK_DATA_PVC="${SPARK_DATA_PVC}" \
+    perl -pe 's#name:\s*spark-data-pvc#name: $ENV{"SPARK_DATA_PVC"}#g' "${SCRIPT_DIR}/efs-pvc.yaml" \
+    | kubectl apply -f -
 
 ok "StorageClass and PVC applied."
 
@@ -290,12 +389,12 @@ ok "All Helm releases installed."
 CURRENT_STEP="8-pvc-bind"
 info "8. Waiting for PVC to bind..."
 
-PVC_STATUS=$(kubectl get pvc spark-data-pvc -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+PVC_STATUS=$(kubectl get pvc "${SPARK_DATA_PVC}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
 if [[ "${PVC_STATUS}" == "Bound" ]]; then
     ok "PVC already bound — skipping wait."
 else
-    if ! kubectl wait --for=condition=bound pvc/spark-data-pvc --timeout=120s; then
-        fail "PVC spark-data-pvc did not bind within 120 seconds."
+    if ! kubectl wait --for=jsonpath='{.status.phase}'=Bound "pvc/${SPARK_DATA_PVC}" --timeout=120s; then
+        fail "PVC ${SPARK_DATA_PVC} did not bind within 120 seconds."
     fi
 fi
 
@@ -305,10 +404,19 @@ ok "PVC bound."
 CURRENT_STEP="9-dataset-migration"
 info "9. Migrating datasets to EFS..."
 
+if is_enabled "${SKIP_DATA_UPLOAD}"; then
+    warn "Skipping dataset upload because SKIP_DATA_UPLOAD=${SKIP_DATA_UPLOAD}."
+    goto_done=1
+else
+    goto_done=0
+fi
+
+if [[ "${goto_done}" -eq 0 ]]; then
+
 # Clean up any leftover upload pod
 kubectl delete pod efs-data-upload --ignore-not-found --wait=true
 
-cat <<'EOF' | kubectl apply -f -
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -326,7 +434,7 @@ spec:
   volumes:
   - name: data
     persistentVolumeClaim:
-      claimName: spark-data-pvc
+      claimName: ${SPARK_DATA_PVC}
 EOF
 
 kubectl wait --for=condition=ready pod/efs-data-upload --timeout=120s
@@ -335,10 +443,14 @@ echo "  Creating directory structure..."
 kubectl exec efs-data-upload -- mkdir -p /data/games /data/input /data/output
 
 echo "  Copying game data..."
-kubectl cp "${SCRIPT_DIR}/../data/games/" efs-data-upload:/data/games/
+kubectl cp "${REPO_ROOT}/${STEAM_DATA_DIR}/" efs-data-upload:/data/games/
 
-echo "  Copying land registry data (5.4 GB — this may take several minutes)..."
-kubectl cp "${SCRIPT_DIR}/../data/input/land-data.csv" efs-data-upload:/data/input/land-data.csv
+if [[ -f "${REPO_ROOT}/${PROPERTY_DATA_FILE}" ]]; then
+    echo "  Copying land registry data (5.4 GB — this may take several minutes)..."
+    kubectl cp "${REPO_ROOT}/${PROPERTY_DATA_FILE}" efs-data-upload:/data/input/land-data.csv
+else
+    warn "Skipping property_prices dataset upload because ${PROPERTY_DATA_FILE} is not present."
+fi
 
 echo "  Verifying upload..."
 kubectl exec efs-data-upload -- sh -c 'echo "=== /data contents ===" && du -sh /data/*'
@@ -348,6 +460,8 @@ kubectl delete pod efs-data-upload --wait=true
 
 ok "Datasets migrated to EFS."
 
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================="
@@ -355,6 +469,7 @@ echo "    AWS EKS Setup Complete!"
 echo "=================================================="
 echo ""
 echo "Next steps:"
-echo "  1. Push your image:    docker push jonathan/spark-app:1.5"
-echo "  3. Run benchmark:      ${SCRIPT_DIR}/../experiment/run_experiment.sh steam_heavy"
+echo "  1. Ensure image exists: docker build -t ${SPARK_APP_IMAGE} . && docker push ${SPARK_APP_IMAGE}"
+echo "  2. Run benchmark:       ${REPO_ROOT}/experiment/run_experiment.sh eks steam_heavy"
+echo "  3. Optional heavy run:  REQUIRE_PROPERTY_DATA=1 ${REPO_ROOT}/experiment/run_experiment.sh property_prices eks"
 echo ""
